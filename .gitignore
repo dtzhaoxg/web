@@ -5,6 +5,9 @@ build/
 release/
 .wheels/
 .cache/
+.claude/
+.codegraph/
+openspec/
 packages/sdk/dist/
 *.tsbuildinfo
 
