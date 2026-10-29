@@ -164,6 +164,7 @@ import {
   writeBytesToHandle,
 } from "./utils/saveFile";
 import { formatBytes } from "./utils/memory";
+import { imageCenter, imageExtent } from "./utils/pixelCenters";
 import { listRecent } from "./storage/recentStore";
 import type {
   AnalysisResult,
@@ -254,6 +255,39 @@ interface PendingPlotResults {
   index: number;
   /** Ids of every result signal created so far across categories. */
   createdIds: string[];
+}
+
+/** Default image rectangle (new ROI or area to erase): a quarter of the
+ *  image extent, centered on its pixel grid. */
+function defaultImageRectangle(img: ImageData): ImageRoiSegment {
+  const { xMin, xMax, yMin, yMax } = imageExtent(img);
+  const center = imageCenter(img);
+  const sx = (xMax - xMin) / 4 || 1;
+  const sy = (yMax - yMin) / 4 || 1;
+  return {
+    geometry: "rectangle",
+    title: "",
+    inverse: false,
+    x0: center.x - sx / 2,
+    y0: center.y - sy / 2,
+    dx: sx,
+    dy: sy,
+  };
+}
+
+/** Default image circle ROI, centered on the pixel grid of the image. */
+function defaultImageCircle(img: ImageData): ImageRoiSegment {
+  const { xMin, xMax, yMin, yMax } = imageExtent(img);
+  const center = imageCenter(img);
+  const r = Math.min(xMax - xMin, yMax - yMin) / 4 || 1;
+  return {
+    geometry: "circle",
+    title: "",
+    inverse: false,
+    xc: center.x,
+    yc: center.y,
+    r,
+  };
 }
 
 /** Build the (hand-made, fully localised) DataSet schema for one
@@ -531,6 +565,18 @@ export default function App() {
       setCentralView("macro");
     }
   }, [macroFloating, setMacroFloating]);
+  // "Save to Macros" in the AI Assistant: the Macros panel saves the
+  // macro (whatever the runtime mode) and shows it. A floating Macros
+  // panel is already visible, so only the docked one gets focus.
+  const saveMacroFromAssistant = useCallback(
+    async (title: string, code: string) => {
+      const panel = macroPanelRef.current;
+      if (!panel) throw new Error("Macros panel is not available yet");
+      await panel.importMacro(title, code);
+      if (!macroFloating) setCentralView("macro");
+    },
+    [macroFloating],
+  );
   // Stable DOM containers for the Notebook / Macro panels.  They are
   // moved between the central area and the FloatingDockStack via
   // ``appendChild`` rather than being unmounted / remounted, so the
@@ -1534,6 +1580,15 @@ export default function App() {
     return selectedGroupIds.filter((gid) => present.has(gid));
   }, [selectedGroupIds, tree]);
 
+  /** Current group of the active panel, where instrument acquisitions go
+   *  when their "New group" option is off: the selected group, otherwise
+   *  the group of the current object (none in an empty panel). */
+  const instrumentCurrentGroupId = useCallback(
+    (): string | null =>
+      effectiveGroupIds()[0] ?? currentSelectionGroupId() ?? null,
+    [effectiveGroupIds, currentSelectionGroupId],
+  );
+
   const runFeature = useCallback(
     async (
       feature: FeatureDescriptor,
@@ -2052,8 +2107,8 @@ export default function App() {
   const handleExtractProfile = useCallback(
     async (params: {
       direction: "horizontal" | "vertical";
-      row: number;
-      col: number;
+      x: number;
+      y: number;
     }) => {
       if (!runtime || !currentId) return;
       const feature = features.find((f) => f.id === "image:line_profile");
@@ -2064,8 +2119,8 @@ export default function App() {
       const values: Record<string, unknown> = {
         ...(schema?.values ?? {}),
         direction: params.direction,
-        row: params.row,
-        col: params.col,
+        x: params.x,
+        y: params.y,
       };
       await runFeature(feature, [currentId], null, values, effectiveGroupIds());
     },
@@ -3143,21 +3198,9 @@ export default function App() {
 
   const handleImageAddRectangle = useCallback(async () => {
     if (!runtime || !currentId || !imageData) return;
-    const sx = (imageData.width * imageData.dx) / 4 || 1;
-    const sy = (imageData.height * imageData.dy) / 4 || 1;
-    const x0 = imageData.x0 + (imageData.width * imageData.dx) / 2 - sx / 2;
-    const y0 = imageData.y0 + (imageData.height * imageData.dy) / 2 - sy / 2;
     const next: ImageRoiSegment[] = [
       ...imageRoi,
-      {
-        geometry: "rectangle",
-        title: "",
-        inverse: false,
-        x0,
-        y0,
-        dx: sx,
-        dy: sy,
-      },
+      defaultImageRectangle(imageData),
     ];
     setImageRoi(next);
     setRoiDrawGeometry(null);
@@ -3168,16 +3211,9 @@ export default function App() {
 
   const handleImageAddCircle = useCallback(async () => {
     if (!runtime || !currentId || !imageData) return;
-    const r =
-      Math.min(
-        imageData.width * imageData.dx,
-        imageData.height * imageData.dy,
-      ) / 4 || 1;
-    const xc = imageData.x0 + (imageData.width * imageData.dx) / 2;
-    const yc = imageData.y0 + (imageData.height * imageData.dy) / 2;
     const next: ImageRoiSegment[] = [
       ...imageRoi,
-      { geometry: "circle", title: "", inverse: false, xc, yc, r },
+      defaultImageCircle(imageData),
     ];
     setImageRoi(next);
     setRoiDrawGeometry(null);
@@ -3375,21 +3411,7 @@ export default function App() {
    *  Mirrors DataLab desktop's ``compute_erase``. */
   const handleOpenErase = useCallback(() => {
     if (!runtime || !currentId || !imageData) return;
-    const sx = (imageData.width * imageData.dx) / 4 || 1;
-    const sy = (imageData.height * imageData.dy) / 4 || 1;
-    const x0 = imageData.x0 + (imageData.width * imageData.dx) / 2 - sx / 2;
-    const y0 = imageData.y0 + (imageData.height * imageData.dy) / 2 - sy / 2;
-    setEraseRegions([
-      {
-        geometry: "rectangle",
-        title: "",
-        inverse: false,
-        x0,
-        y0,
-        dx: sx,
-        dy: sy,
-      },
-    ]);
+    setEraseRegions([defaultImageRectangle(imageData)]);
     setSelectedRoiIndex(0);
     setActiveRoiVertex(null);
     setRoiDrawGeometry("rectangle");
@@ -3677,11 +3699,12 @@ export default function App() {
                 Array.from(supported),
                 null,
               );
-              if (result.uint32_clipped) {
+              if (result.inexact_values) {
                 await notify({
                   kind: "warning",
-                  message:
-                    "Some uint32 image data was clipped to int32 range during import.",
+                  message: t(
+                    "Some integer values could not be represented exactly and were rounded during import.",
+                  ),
                 });
               }
               setWorkspaceVersion((v) => v + 1);
@@ -3915,13 +3938,14 @@ export default function App() {
   );
 
   const handleH5BrowserImport = useCallback(
-    async (oids: string[], uint32Clipped: boolean) => {
+    async (oids: string[], inexactValues: boolean) => {
       setH5BrowserFiles(null);
-      if (uint32Clipped) {
+      if (inexactValues) {
         await notify({
           kind: "warning",
-          message:
-            "Some uint32 image data was clipped to int32 range during import.",
+          message: t(
+            "Some integer values could not be represented exactly and were rounded during import.",
+          ),
         });
       }
       await refreshImportedObjects(oids);
@@ -5216,12 +5240,7 @@ export default function App() {
                   imageRoi={imageEraseMode ? eraseRegions : imageRoi}
                   bounds={
                     treeKind === "image" && imageData
-                      ? {
-                          xMin: imageData.x0,
-                          xMax: imageData.x0 + imageData.width * imageData.dx,
-                          yMin: imageData.y0,
-                          yMax: imageData.y0 + imageData.height * imageData.dy,
-                        }
+                      ? imageExtent(imageData)
                       : {
                           xMin: data?.x[0] ?? 0,
                           xMax: data?.x[(data?.x.length ?? 1) - 1] ?? 1,
@@ -5289,6 +5308,7 @@ export default function App() {
               >
                 <AIAssistantPanel
                   runtime={runtime}
+                  onSaveMacro={saveMacroFromAssistant}
                   onMinimize={() => setAIPanelCollapsed(true)}
                   onClose={() => setAIPanelVisible(false)}
                 />
@@ -5571,6 +5591,7 @@ export default function App() {
             key={`${instrumentTool.pluginId}:${instrumentTool.toolId}`}
             pluginId={instrumentTool.pluginId}
             toolId={instrumentTool.toolId}
+            currentGroupId={instrumentCurrentGroupId}
             onAcquired={handleInstrumentAcquired}
             onClose={() => setInstrumentTool(null)}
           />

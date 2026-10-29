@@ -697,6 +697,8 @@ export interface PluginInstrumentSession {
   title: string;
   settings: SchemaWithValues;
   live_interval_ms: number;
+  /** Default state of the "New group" option, set by the instrument. */
+  new_group: boolean;
 }
 
 /** Live frame of an instrument: signals drawn together, or one image. */
@@ -1089,7 +1091,9 @@ export interface ImageData {
    *  typed-array rows directly as ``z``. */
   data: Float32Array[] | number[][];
   dtype: string;
-  /** Pixel origin (top-left corner) and pixel spacing. */
+  /** Center of the first pixel (Sigima convention) and pixel spacing: pixel
+   *  ``(i, j)`` is centered on ``(x0 + i·dx, y0 + j·dy)``, so the image spans
+   *  ``[x0 - dx/2, x0 + (width - ½)·dx]``. */
   x0: number;
   y0: number;
   dx: number;
@@ -1299,7 +1303,9 @@ export interface H5BrowserArray {
 /** Result of importing selected HDF5 nodes into the live model. */
 export interface H5BrowserImportResult {
   oids: string[];
-  uint32_clipped: boolean;
+  /** True when integer values could not all be represented exactly
+   *  (beyond 2**53). */
+  inexact_values: boolean;
 }
 
 /**
@@ -1558,6 +1564,14 @@ export interface MacroLintProxyCall extends MacroLintLocation {
 }
 
 /** Result of statically linting a macro source. */
+/** Captured output of a macro run by :meth:`DataLabRuntime.runMacroCode`. */
+export interface MacroRunOutput {
+  stdout: string;
+  stderr: string;
+  status: "ok" | "error" | "stopped";
+  error?: string;
+}
+
 export interface MacroLintResult {
   ok: boolean;
   syntax_error: { line: number; col: number; message: string } | null;
@@ -2322,16 +2336,43 @@ await micropip.install(${JSON.stringify(bootRequirements)})
     return pagedIn;
   }
 
-  /** Spill object *oid* to disk, serialising it afresh (direct, unqueued). */
+  /** Spill object *oid* to disk, serialising it afresh (direct, unqueued).
+   *
+   *  The Python side drops the array when it serialises it: if the bytes
+   *  cannot be persisted (quota exceeded, write error...), they are attached
+   *  back before the error is propagated, so that the object stays resident
+   *  with its data and both registries agree it is not spilled. */
   private async spillDirect(oid: string): Promise<boolean> {
     if (this.spilledOids.has(oid)) return false;
     const bytes = (await this.invokePy("detach_object_array", {
       oid,
     })) as Uint8Array | null;
     if (!bytes || bytes.byteLength === 0) return false;
-    await this.requireStore().put(oid, bytes);
+    await this.persistOrRestore(oid, bytes);
     this.spilledOids.add(oid);
     return true;
+  }
+
+  /** Persist the *bytes* just detached from object *oid*, or attach them
+   *  back to the object if they cannot be persisted (and rethrow). A copy
+   *  left partially written on disk is deleted (best effort): the object is
+   *  no longer spilled, so it would never be read anyway. */
+  private async persistOrRestore(
+    oid: string,
+    bytes: Uint8Array,
+  ): Promise<void> {
+    const store = this.requireStore();
+    try {
+      await store.put(oid, bytes);
+    } catch (err) {
+      await this.invokePy("attach_object_array", {
+        oid,
+        payload: bytes,
+        on_disk: false,
+      });
+      await store.delete(oid).catch(() => undefined);
+      throw err;
+    }
   }
 
   /** Return a paged-in object to disk once the call that needed it is over
@@ -2352,7 +2393,9 @@ await micropip.install(${JSON.stringify(bootRequirements)})
       return;
     }
     if (settled.state === "rewritten") {
-      await this.requireStore().put(oid, settled.payload as Uint8Array);
+      // The changed data is attached back if it cannot replace the on-disk
+      // copy: the object then stays resident (see ``persistOrRestore``)
+      await this.persistOrRestore(oid, settled.payload as Uint8Array);
     }
     this.spilledOids.add(oid);
   }
@@ -3812,16 +3855,22 @@ await micropip.install(${JSON.stringify(bootRequirements)})
     };
   }
 
-  /** Add an acquisition of a plugin instrument to the workspace. */
+  /** Add an acquisition of a plugin instrument to the workspace: to the
+   *  current group *currentGroupId* when *newGroup* is false and this group
+   *  belongs to the panel of the acquired objects, otherwise to a new group. */
   async acquirePluginInstrument(
     pluginId: string,
     toolId: string,
     values: Record<string, unknown>,
+    newGroup = true,
+    currentGroupId: string | null = null,
   ): Promise<PluginInstrumentAcquisition> {
     return (await this.callPy("acquire_plugin_instrument", {
       plugin_id: pluginId,
       tool_id: toolId,
       values,
+      new_group: newGroup,
+      current_group_id: currentGroupId,
     })) as PluginInstrumentAcquisition;
   }
 
@@ -4715,16 +4764,10 @@ await micropip.install(${JSON.stringify(bootRequirements)})
   // amortise the Pyodide worker cold-start across calls).
   // ---------------------------------------------------------------------
 
-  /** Last buffered output from :meth:`runMacroCode` (or ``null`` if no
-   *  macro has run yet through this runtime). Surfaced to the LLM via
-   *  the ``get_macro_console_output`` tool — useful when the previous
-   *  call truncated its output. */
-  lastMacroOutput: {
-    stdout: string;
-    stderr: string;
-    status: "ok" | "error" | "stopped";
-    error?: string;
-  } | null = null;
+  /** Last buffered output from :meth:`runMacroCode`, read through
+   *  :meth:`getLastMacroOutput` (a public *field* would not cross the
+   *  worker boundary: the worker-backed façade only forwards methods). */
+  private _lastMacroOutput: MacroRunOutput | null = null;
 
   private _macroRuntime: import("./MacroRuntime").MacroRuntime | null = null;
 
@@ -4737,20 +4780,24 @@ await micropip.install(${JSON.stringify(bootRequirements)})
     return this._macroRuntime;
   }
 
+  /** Return the buffered output of the last macro run through
+   *  :meth:`runMacroCode` (or ``null`` if no macro has run yet through
+   *  this runtime). Surfaced to the LLM via the
+   *  ``get_macro_console_output`` tool — useful when the previous call
+   *  truncated its output. */
+  async getLastMacroOutput(): Promise<MacroRunOutput | null> {
+    return this._lastMacroOutput;
+  }
+
   /** Run *code* as a transient macro and resolve once it completes
    *  with the captured stdout/stderr.  The macro is NOT persisted in
-   *  the workspace's macro panel — use :meth:`saveMacro` to register
-   *  it on user demand. Output is also stashed in
-   *  :prop:`lastMacroOutput` for the ``get_macro_console_output`` tool. */
+   *  the workspace's macro panel: the AI Assistant UI saves it on user
+   *  demand through the Macros panel. Output is also kept for
+   *  :meth:`getLastMacroOutput`. */
   async runMacroCode(
     code: string,
     name = "AI Assistant macro",
-  ): Promise<{
-    stdout: string;
-    stderr: string;
-    status: "ok" | "error" | "stopped";
-    error?: string;
-  }> {
+  ): Promise<MacroRunOutput> {
     const macro = await this.ensureMacroRuntime();
     return new Promise((resolve, reject) => {
       let stdout = "";
@@ -4763,32 +4810,12 @@ await micropip.install(${JSON.stringify(bootRequirements)})
           },
           onFinished: (status, error) => {
             const out = { stdout, stderr, status, error };
-            this.lastMacroOutput = out;
+            this._lastMacroOutput = out;
             resolve(out);
           },
         })
         .catch(reject);
     });
-  }
-
-  /** Persist *code* in the workspace's macro panel under *name* and
-   *  notify open MacroPanel instances so the new entry shows up
-   *  immediately. Used by the AI Assistant's "Save to Macros" button
-   *  (the user explicitly opts in — macros run via
-   *  :meth:`runMacroCode` are otherwise transient). */
-  async saveMacro(
-    name: string,
-    code: string,
-  ): Promise<{ id: string; title: string }> {
-    const rec = await this.createMacro(name, code);
-    if (typeof window !== "undefined") {
-      window.dispatchEvent(
-        new CustomEvent("dlw:macros-changed", {
-          detail: { id: rec.id, title: rec.title },
-        }),
-      );
-    }
-    return { id: rec.id, title: rec.title };
   }
 
   async listPlugins(): Promise<PluginRecord[]> {

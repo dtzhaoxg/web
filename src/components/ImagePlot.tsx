@@ -34,13 +34,22 @@ import {
   shouldUseLod,
 } from "../utils/imageLod";
 import {
-  type ImageRasterPlacement,
+  CRISP_PIXELS_CLASS,
+  type ImageRasterResult,
   RASTER_DEBOUNCE_MS,
+  showsCrispPixels,
   normalizeResampleMethod,
+  rasterLayoutImage,
   rasterizeImage,
 } from "../utils/imageRaster";
-import { toBins, binSearchCell } from "../utils/imageCoords";
+import { toBins } from "../utils/imageCoords";
 import { relayoutViewRange } from "../utils/plotlyRelayout";
+import {
+  imageExtent,
+  pixelCenters,
+  pixelIndexAt,
+  pixelRangeOverlapping,
+} from "../utils/pixelCenters";
 import { usePersistedBool, IMAGE_GRID_PREF_KEY } from "../utils/persisted";
 import type {
   AnalysisResult,
@@ -125,13 +134,15 @@ interface ImagePlotProps {
   onResampleChange?: (method: ResampleMethod) => void;
   /** Called when the user clicks one of the "extract profile" buttons next
    *  to a frozen cross-section preview.  ``direction`` selects the horizontal
-   *  (top preview, fixed ``row``) or vertical (right preview, fixed ``col``)
-   *  slice.  The host wires this to the Sigima ``line_profile`` feature so a
-   *  new signal is created, mirroring DataLab desktop's "Process signal". */
+   *  (top preview, fixed ``y``) or vertical (right preview, fixed ``x``)
+   *  slice; ``x``/``y`` are the physical coordinates of the center of the
+   *  pixel under the cursor (Sigima convention).  The host wires this to the
+   *  Sigima ``line_profile`` feature so a new signal is created, mirroring
+   *  DataLab desktop's "Process signal". */
   onExtractProfile?: (params: {
     direction: "horizontal" | "vertical";
-    row: number;
-    col: number;
+    x: number;
+    y: number;
   }) => void;
 }
 
@@ -313,34 +324,34 @@ export function ImagePlot({
     () => (isUniform || !data.ycoords?.length ? null : toBins(data.ycoords)),
     [isUniform, data.ycoords],
   );
-  // Physical extent of the image, used for axis ranges and crosshairs.
-  // For non-uniform images it spans the first/last bin edges; for uniform
-  // images it is the regular ``x0 + width·dx`` rectangle.
-  const extent = useMemo(() => {
-    if (xEdges && yEdges && xEdges.length > 1 && yEdges.length > 1) {
-      return {
-        xMin: xEdges[0],
-        xMax: xEdges[xEdges.length - 1],
-        yMin: yEdges[0],
-        yMax: yEdges[yEdges.length - 1],
-      };
-    }
-    return {
-      xMin: data.x0,
-      xMax: data.x0 + data.width * data.dx,
-      yMin: data.y0,
-      yMax: data.y0 + data.height * data.dy,
-    };
-  }, [
-    xEdges,
-    yEdges,
-    data.x0,
-    data.y0,
-    data.width,
-    data.height,
-    data.dx,
-    data.dy,
-  ]);
+  // Physical extent of the image up to the outer edges of its pixels (``x0``/
+  // ``y0`` and ``xcoords``/``ycoords`` are pixel centers), used for axis
+  // ranges and crosshairs.
+  const extent = useMemo(
+    () =>
+      imageExtent({
+        width: data.width,
+        height: data.height,
+        x0: data.x0,
+        y0: data.y0,
+        dx: data.dx,
+        dy: data.dy,
+        is_uniform_coords: data.is_uniform_coords,
+        xcoords: data.xcoords,
+        ycoords: data.ycoords,
+      }),
+    [
+      data.width,
+      data.height,
+      data.x0,
+      data.y0,
+      data.dx,
+      data.dy,
+      data.is_uniform_coords,
+      data.xcoords,
+      data.ycoords,
+    ],
+  );
 
   // ------------------------------------------------------------------
   // Canvas rasterisation pipeline.
@@ -391,11 +402,9 @@ export function ImagePlot({
     h: 1024,
   });
   const plotPxRef = useRef(plotPx);
-  // Physical placement of the (possibly windowed) bitmap, plus its pixel
-  // dimensions (``cw``/``ch``) so it can be sized as a ``layout.images``
-  // background image. ``null`` falls back to the full-image geometry.
-  const [bitmapPlacement, setBitmapPlacement] =
-    useState<ImageRasterPlacement | null>(null);
+  // Rasterised (possibly windowed) bitmap with its physical placement and
+  // pixel dimensions, drawn as a ``layout.images`` background.
+  const [bitmap, setBitmap] = useState<ImageRasterResult | null>(null);
   // Reset the view whenever the underlying image changes so a new image
   // opens at full extent.
   useEffect(() => {
@@ -419,13 +428,11 @@ export function ImagePlot({
     const scaleratio = isUniform ? data.dy / data.dx : 1;
     return aspectFitRanges(winX, winY, plotPx, scaleratio);
   }, [viewRange, extent, isUniform, data.dx, data.dy, plotPx]);
-  const [bitmapUrl, setBitmapUrl] = useState<string | null>(null);
   useEffect(() => {
     // Non-uniform images are rendered by a ``heatmap`` trace (see below),
     // not the canvas bitmap — skip the rasterisation entirely.
     if (data.is_uniform_coords === false) {
-      setBitmapUrl(null);
-      setBitmapPlacement(null);
+      setBitmap(null);
       return;
     }
     const w = data.width;
@@ -454,8 +461,7 @@ export function ImagePlot({
         inverted: colormapInverted,
         resampleMethod,
       });
-      setBitmapUrl(raster?.source ?? null);
-      setBitmapPlacement(raster?.placement ?? null);
+      setBitmap(raster);
     }, RASTER_DEBOUNCE_MS);
     return () => window.clearTimeout(handle);
   }, [
@@ -526,10 +532,10 @@ export function ImagePlot({
   }, []);
 
   const traces = useMemo(() => {
-    // Background image trace — rasterised by Plotly with a single
-    // ``drawImage`` from the blob URL.  When ``bitmapUrl`` is still
-    // null (first paint or in-flight repaint) we omit the trace so
-    // only the axes/shapes layer is shown.
+    // Background image — rasterised by Plotly with a single ``drawImage``
+    // from the data URL (see ``layoutImages``).  While the bitmap is still
+    // null (first paint or in-flight repaint) only the axes/shapes layer is
+    // shown.
     const out: unknown[] = [];
     // ------------------------------------------------------------------
     // Non-uniform images: exact ``heatmap`` rendering with bin edges.
@@ -756,45 +762,30 @@ export function ImagePlot({
   // Uniform-image bitmap drawn as a ``layout.images`` background.  Unlike the
   // ``image`` trace it replaces, a layout image imposes no axis constraint,
   // so the axes stay free and both directions can be panned (square pixels
-  // are kept via the aspect-fitted ``displayRange``).  ``bitmapPlacement``
-  // carries the windowed sub-bitmap origin / per-cell spacing / pixel size so
+  // are kept via the aspect-fitted ``displayRange``).  The raster placement
+  // carries the windowed sub-bitmap corner / per-cell spacing / pixel size so
   // the (possibly decimated) LOD bitmap lands on the right physical extent.
-  const layoutImages = useMemo(() => {
-    if (!bitmapUrl || data.is_uniform_coords === false) return [];
-    const p = bitmapPlacement ?? {
-      x0: data.x0,
-      dx: data.dx,
-      y0: data.y0,
-      dy: data.dy,
-      cw: data.width,
-      ch: data.height,
-    };
-    return [
-      {
-        source: bitmapUrl,
-        xref: "x" as const,
-        yref: "y" as const,
-        x: p.x0,
-        y: p.y0,
-        sizex: p.cw * p.dx,
-        sizey: p.ch * p.dy,
-        xanchor: "left" as const,
-        yanchor: "top" as const,
-        sizing: "stretch" as const,
-        layer: "below" as const,
-      },
-    ];
-  }, [
-    bitmapUrl,
-    bitmapPlacement,
-    data.is_uniform_coords,
-    data.x0,
-    data.y0,
-    data.dx,
-    data.dy,
-    data.width,
-    data.height,
-  ]);
+  const layoutImages = useMemo(
+    () =>
+      bitmap && data.is_uniform_coords !== false
+        ? [rasterLayoutImage(bitmap)]
+        : [],
+    [bitmap, data.is_uniform_coords],
+  );
+  // Zoomed in, the bitmap is magnified into sharp pixel blocks; the browser
+  // must not smooth what remains of its enlargement on screen.
+  const crispPixels = useMemo(
+    () =>
+      bitmap !== null &&
+      data.is_uniform_coords !== false &&
+      showsCrispPixels(
+        bitmap,
+        displayRange,
+        plotPx,
+        window.devicePixelRatio || 1,
+      ),
+    [bitmap, data.is_uniform_coords, displayRange, plotPx],
+  );
 
   const layout = useMemo(() => {
     const xtitle = data.xunit ? `${data.xlabel} (${data.xunit})` : data.xlabel;
@@ -1021,16 +1012,11 @@ export function ImagePlot({
           dragEl.style.setProperty("cursor", cur, cur ? "important" : "");
         }
       }
-      // Map data coords → cell indices.  Uniform images use the regular
-      // grid; non-uniform images binary-search the bin edges so the
-      // reported ``z`` is exact (no quantisation).
-      const i = xEdges
-        ? binSearchCell(xEdges, xData)
-        : Math.floor((xData - data.x0) / data.dx);
-      const j = yEdges
-        ? binSearchCell(yEdges, yData)
-        : Math.floor((yData - data.y0) / data.dy);
-      if (i < 0 || i >= data.width || j < 0 || j >= data.height) {
+      // Map data coords → pixel indices: the pixel whose center is the
+      // closest (exact for non-uniform images too, no quantisation).
+      const i = pixelIndexAt(data, "x", xData);
+      const j = pixelIndexAt(data, "y", yData);
+      if (i < 0 || j < 0) {
         hoverOverlayRef.current?.setHover(null);
         return;
       }
@@ -1039,7 +1025,7 @@ export function ImagePlot({
       hoverOverlayRef.current?.setHover({ x: xData, y: yData, z, px, py });
       if (tool === "profiles" && !frozen) setCursor({ x: xData, y: yData });
     },
-    [data, tool, xEdges, yEdges, frozen, roiEditMode, roi],
+    [data, tool, frozen, roiEditMode, roi],
   );
 
   const handleWrapperMouseLeave = useCallback(() => {
@@ -1435,43 +1421,33 @@ export function ImagePlot({
   // ------------------------------------------------------------------
   const profileData = useMemo(() => {
     if (tool !== "profiles" || !cursor) return null;
-    const col = Math.round((cursor.x - data.x0) / data.dx - 0.5);
-    const row = Math.round((cursor.y - data.y0) / data.dy - 0.5);
-    if (col < 0 || col >= data.width || row < 0 || row >= data.height)
-      return null;
-    const xs = Array.from(
-      { length: data.width },
-      (_, i) => data.x0 + (i + 0.5) * data.dx,
-    );
-    const ys = Array.from(
-      { length: data.height },
-      (_, j) => data.y0 + (j + 0.5) * data.dy,
-    );
+    const col = pixelIndexAt(data, "x", cursor.x);
+    const row = pixelIndexAt(data, "y", cursor.y);
+    if (col < 0 || row < 0) return null;
+    const xs = pixelCenters(data, "x");
+    const ys = pixelCenters(data, "y");
     const xProfile = data.data[row].slice();
     const yProfile = data.data.map((r) => r[col]);
     return { xs, ys, xProfile, yProfile, row, col };
   }, [tool, cursor, data]);
 
   // ------------------------------------------------------------------
-  // Stats over the user-drawn rectangle (pure JS over data.data).
+  // Stats over the user-drawn rectangle (pure JS over data.data): every
+  // pixel the rectangle covers, even partly, as in DataLab desktop.
   // ------------------------------------------------------------------
   const statsValues = useMemo(() => {
     if (tool !== "stats" || !statsRect) return null;
-    const i0 = Math.max(
-      0,
-      Math.floor((Math.min(statsRect.x0, statsRect.x1) - data.x0) / data.dx),
+    const [i0, i1] = pixelRangeOverlapping(
+      data,
+      "x",
+      statsRect.x0,
+      statsRect.x1,
     );
-    const i1 = Math.min(
-      data.width,
-      Math.ceil((Math.max(statsRect.x0, statsRect.x1) - data.x0) / data.dx),
-    );
-    const j0 = Math.max(
-      0,
-      Math.floor((Math.min(statsRect.y0, statsRect.y1) - data.y0) / data.dy),
-    );
-    const j1 = Math.min(
-      data.height,
-      Math.ceil((Math.max(statsRect.y0, statsRect.y1) - data.y0) / data.dy),
+    const [j0, j1] = pixelRangeOverlapping(
+      data,
+      "y",
+      statsRect.y0,
+      statsRect.y1,
     );
     if (i1 <= i0 || j1 <= j0) return null;
     let sum = 0;
@@ -1562,7 +1538,7 @@ export function ImagePlot({
             ? " profiles-frozen"
             : " profiles-live"
           : ""
-      }`}
+      }${crispPixels ? ` ${CRISP_PIXELS_CLASS}` : ""}`}
       style={{ position: "relative", width: "100%", height: "100%" }}
       onMouseDownCapture={handleHostMouseDownCapture}
       onMouseMove={handleWrapperMouseMove}
@@ -1622,7 +1598,7 @@ export function ImagePlot({
                       margin: { l: 60, r: 30, t: 5, b: 5 },
                       xaxis: {
                         ...plotlyTheme.xaxis,
-                        range: [data.x0, data.x0 + data.width * data.dx],
+                        range: [extent.xMin, extent.xMax],
                         showticklabels: false,
                       },
                       yaxis: {
@@ -1650,8 +1626,8 @@ export function ImagePlot({
                   onClick={() =>
                     onExtractProfile({
                       direction: "horizontal",
-                      row: profileData.row,
-                      col: profileData.col,
+                      x: pixelCenters(data, "x")[profileData.col],
+                      y: pixelCenters(data, "y")[profileData.row],
                     })
                   }
                 >
@@ -1696,7 +1672,7 @@ export function ImagePlot({
                       },
                       yaxis: {
                         ...plotlyTheme.yaxis,
-                        range: [data.y0 + data.height * data.dy, data.y0],
+                        range: [extent.yMax, extent.yMin],
                         showticklabels: false,
                       },
                       showlegend: false,
@@ -1715,8 +1691,8 @@ export function ImagePlot({
                   onClick={() =>
                     onExtractProfile({
                       direction: "vertical",
-                      row: profileData.row,
-                      col: profileData.col,
+                      x: pixelCenters(data, "x")[profileData.col],
+                      y: pixelCenters(data, "y")[profileData.row],
                     })
                   }
                 >

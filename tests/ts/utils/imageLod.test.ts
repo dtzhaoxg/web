@@ -3,7 +3,8 @@
  *
  * These pure functions decide which source pixels are visible, at what
  * stride they are rasterised, and where the resulting bitmap is placed.
- * Pixel-coordinate exactness matters: an off-by-half-pixel here would shift
+ * Pixel-coordinate exactness matters: ``x0``/``y0`` are the centers of the
+ * first pixel (Sigima convention), and an off-by-half-pixel here would shift
  * the displayed image relative to overlays, ROIs and the (full-resolution)
  * hover read-out.  The windowed paint helper is also checked to confirm the
  * three resampling methods aggregate the **data** (not colours) correctly.
@@ -13,6 +14,7 @@ import {
   type ImageGeometry,
   DEFAULT_MAX_RASTER_DIM,
   LOD_MIN_PIXELS,
+  isMagnified,
   rasterPlan,
   shouldUseLod,
   visibleWindow,
@@ -57,13 +59,20 @@ describe("visibleWindow", () => {
   });
 
   it("maps a zoom rectangle to pixel indices (Y reversed)", () => {
-    // Plotly reports Y reversed; the helper normalises with min/max.
-    const win = visibleWindow(GEOM, { x: [100, 200], y: [300, 200] });
+    // Plotly reports Y reversed; the helper normalises with min/max.  Pixel
+    // ``i`` is centered on ``i`` and covers ``[i - 0.5, i + 0.5)``.
+    const win = visibleWindow(GEOM, { x: [99.5, 199.5], y: [299.5, 199.5] });
     expect(win).toEqual({ i0: 100, i1: 200, j0: 200, j1: 300 });
   });
 
+  it("includes the pixels whose half lies in the view", () => {
+    // [100, 200] covers the right half of pixel 100 and the left half of 200.
+    const win = visibleWindow(GEOM, { x: [100, 200], y: [300, 200] });
+    expect(win).toEqual({ i0: 100, i1: 201, j0: 200, j1: 301 });
+  });
+
   it("clamps a partially out-of-bounds view to the image", () => {
-    const win = visibleWindow(GEOM, { x: [-50, 50], y: [50, -50] });
+    const win = visibleWindow(GEOM, { x: [-50, 49.5], y: [49.5, -50] });
     expect(win).toEqual({ i0: 0, i1: 50, j0: 0, j1: 50 });
   });
 
@@ -75,7 +84,7 @@ describe("visibleWindow", () => {
   });
 
   it("covers a sub-pixel view with at least one pixel", () => {
-    const win = visibleWindow(GEOM, { x: [100.3, 100.7], y: [100.7, 100.3] });
+    const win = visibleWindow(GEOM, { x: [99.8, 100.2], y: [100.2, 99.8] });
     expect(win).toEqual({ i0: 100, i1: 101, j0: 100, j1: 101 });
   });
 
@@ -88,16 +97,19 @@ describe("visibleWindow", () => {
       dx: 0.5,
       dy: 2,
     };
-    // x: [20, 30] → (x-10)/0.5 = [20, 40]; y: [60, 40] → (y-20)/2 = [20, 10].
-    const win = visibleWindow(geom, { x: [20, 30], y: [60, 40] });
+    // x: [19.75, 29.75] → (x-10)/0.5 + 0.5 = [20, 40];
+    // y: [59, 39] → (y-20)/2 + 0.5 = [20, 10].
+    const win = visibleWindow(geom, { x: [19.75, 29.75], y: [59, 39] });
     expect(win).toEqual({ i0: 20, i1: 40, j0: 10, j1: 20 });
   });
 });
 
 describe("rasterPlan", () => {
-  it("renders 1:1 when zoomed in (window smaller than the display)", () => {
+  it("magnifies a zoomed-in window by integer factors", () => {
     const win = { i0: 100, i1: 110, j0: 200, j1: 215 };
     const plan = rasterPlan(win, 900, 900, 1);
+    // Every pixel is painted (stride 1), then drawn as a 90 × 60 block:
+    // floor(900 / 10) = 90 and floor(900 / 15) = 60.
     expect(plan).toEqual({
       i0: 100,
       j0: 200,
@@ -105,7 +117,10 @@ describe("rasterPlan", () => {
       ch: 15,
       strideX: 1,
       strideY: 1,
+      zoomX: 90,
+      zoomY: 60,
     });
+    expect(isMagnified(plan)).toBe(true);
   });
 
   it("decimates to the display resolution when zoomed out", () => {
@@ -116,6 +131,7 @@ describe("rasterPlan", () => {
     expect(plan.strideY).toBe(5);
     expect(plan.cw).toBe(Math.ceil(4096 / 5));
     expect(plan.ch).toBe(Math.ceil(4096 / 5));
+    expect(isMagnified(plan)).toBe(false);
   });
 
   it("caps the output at maxDim even on hi-DPI displays", () => {
@@ -124,6 +140,7 @@ describe("rasterPlan", () => {
     // plotW*dpr = 8000 but capped to 2048 → stride = ceil(4096/2048) = 2.
     expect(plan.strideX).toBe(2);
     expect(plan.cw).toBe(2048);
+    expect(plan.zoomX).toBe(1);
   });
 
   it("accounts for the device pixel ratio when zooming in", () => {
@@ -132,16 +149,43 @@ describe("rasterPlan", () => {
     const plan = rasterPlan(win, 800, 800, 2);
     expect(plan.strideX).toBe(1);
     expect(plan.cw).toBe(1500);
+    expect(plan.zoomX).toBe(1);
+    // 10 pixels over 900 CSS px at DPR 2 → blocks of 180 device pixels.
+    expect(
+      rasterPlan({ i0: 0, i1: 10, j0: 0, j1: 10 }, 900, 900, 2),
+    ).toMatchObject({ zoomX: 180, zoomY: 180 });
+  });
+
+  it("magnifies from two device pixels per image pixel", () => {
+    const plan = (n: number) =>
+      rasterPlan({ i0: 0, i1: n, j0: 0, j1: n }, 900, 900, 1);
+    expect(plan(451).zoomX).toBe(1); // 1.99 device pixels per image pixel
+    expect(plan(450).zoomX).toBe(2);
+    expect(plan(300).zoomX).toBe(3);
+  });
+
+  it("keeps the magnified bitmap within maxDim", () => {
+    const plan = rasterPlan({ i0: 0, i1: 10, j0: 0, j1: 3 }, 4000, 4000, 2);
+    // avail = 2048 → floor(2048 / 10) = 204 and floor(2048 / 3) = 682.
+    expect(plan.zoomX).toBe(204);
+    expect(plan.zoomY).toBe(682);
+    expect(plan.cw * plan.zoomX).toBeLessThanOrEqual(DEFAULT_MAX_RASTER_DIM);
+    expect(plan.ch * plan.zoomY).toBeLessThanOrEqual(DEFAULT_MAX_RASTER_DIM);
+  });
+
+  it("magnifies each axis independently", () => {
+    const plan = rasterPlan({ i0: 0, i1: 10, j0: 0, j1: 3000 }, 900, 900, 1);
+    expect(plan).toMatchObject({ strideX: 1, zoomX: 90, strideY: 4, zoomY: 1 });
   });
 });
 
 describe("windowPlacement", () => {
-  it("places a 1:1 window at the exact pixel origin", () => {
+  it("places a 1:1 window at the outer edge of its first pixel", () => {
     const plan = { i0: 100, j0: 200, cw: 10, ch: 15, strideX: 1, strideY: 1 };
     expect(windowPlacement(plan, GEOM)).toEqual({
-      x0: 100,
+      x: 99.5,
       dx: 1,
-      y0: 200,
+      y: 199.5,
       dy: 1,
     });
   });
@@ -149,9 +193,9 @@ describe("windowPlacement", () => {
   it("scales the cell size by the stride when decimating", () => {
     const plan = { i0: 0, j0: 0, cw: 820, ch: 820, strideX: 5, strideY: 5 };
     expect(windowPlacement(plan, GEOM)).toEqual({
-      x0: 0,
+      x: -0.5,
       dx: 5,
-      y0: 0,
+      y: -0.5,
       dy: 5,
     });
   });
@@ -167,19 +211,65 @@ describe("windowPlacement", () => {
     };
     const plan = { i0: 100, j0: 10, cw: 5, ch: 5, strideX: 2, strideY: 3 };
     expect(windowPlacement(plan, geom)).toEqual({
-      x0: 10 + 100 * 0.5,
+      x: 10 + (100 - 0.5) * 0.5,
       dx: 0.5 * 2,
-      y0: 20 + 10 * 2,
+      y: 20 + (10 - 0.5) * 2,
       dy: 2 * 3,
     });
   });
 });
 
+describe("pixel-center convention (x0/y0 = center of the first pixel)", () => {
+  it("draws a 4×4 image with x0 = y0 = 0 over [-0.5, 3.5]", () => {
+    // Sigima pixel centers are at 0, 1, 2, 3: the image spans [-0.5, 3.5].
+    const geometry = { width: 4, height: 4, x0: 0, y0: 0, dx: 1, dy: 1 };
+    const raster = planImageRaster(geometry, null, { w: 400, h: 400 }, 1);
+    expect(raster?.placement).toEqual({
+      x: -0.5,
+      dx: 1,
+      y: -0.5,
+      dy: 1,
+      cw: 4,
+      ch: 4,
+    });
+  });
+
+  it("centers the pixels of a calibrated image on x0 + i·dx", () => {
+    const geometry = { width: 8, height: 6, x0: 10, y0: -3, dx: 0.5, dy: 2 };
+    const raster = planImageRaster(geometry, null, { w: 400, h: 400 }, 1);
+    const p = raster!.placement;
+    // Center of output cell ``i`` = x + (i + 0.5)·dx = x0 + i·dx.
+    expect(p.x + 0.5 * p.dx).toBe(10);
+    expect(p.y + 0.5 * p.dy).toBe(-3);
+    expect(p.x + p.cw * p.dx).toBe(10 + 7.5 * 0.5);
+    expect(p.y + p.ch * p.dy).toBe(-3 + 5.5 * 2);
+  });
+
+  it("keeps an image whose outer half-pixel only is in view", () => {
+    const geometry = { width: 4, height: 4, x0: 0, y0: 0, dx: 1, dy: 1 };
+    const view = {
+      x: [-2, -0.25] as [number, number],
+      y: [3.25, 2] as [number, number],
+    };
+    expect(planImageRaster(geometry, view, { w: 400, h: 400 }, 1)).not.toBe(
+      null,
+    );
+    const outside = {
+      x: [-2, -0.6] as [number, number],
+      y: [3.25, 2] as [number, number],
+    };
+    expect(planImageRaster(geometry, outside, { w: 400, h: 400 }, 1)).toBe(
+      null,
+    );
+  });
+});
+
 describe("shared spatial raster planning", () => {
   it("assigns four 2048² images their on-screen share of the viewport", () => {
+    // The four images tile [-0.5, 4095.5]² (pixel centers 0…4095).
     const view = {
-      x: [0, 4096] as [number, number],
-      y: [4096, 0] as [number, number],
+      x: [-0.5, 4095.5] as [number, number],
+      y: [4095.5, -0.5] as [number, number],
     };
     const origins = [
       [0, 0],
@@ -197,15 +287,17 @@ describe("shared spatial raster planning", () => {
       expect(raster).not.toBeNull();
       expect(raster!.plan.cw).toBeLessThanOrEqual(500);
       expect(raster!.plan.ch).toBeLessThanOrEqual(400);
-      expect(raster!.placement.x0).toBe(x0);
-      expect(raster!.placement.y0).toBe(y0);
+      // Upper-left corner = outer edge of the first pixel.
+      expect(raster!.placement.x).toBe(x0 - 0.5);
+      expect(raster!.placement.y).toBe(y0 - 0.5);
     }
   });
 
   it("skips off-screen images and restores exact pixels after zoom", () => {
+    // Pixels 10…25 of the visible image (centers 2058…2073) and rows 0…15.
     const zoom = {
-      x: [2058, 2074] as [number, number],
-      y: [16, 0] as [number, number],
+      x: [2057.5, 2073.5] as [number, number],
+      y: [15.5, -0.5] as [number, number],
     };
     const visible = { ...GEOM, width: 2048, height: 2048, x0: 2048 };
     const hidden = { ...GEOM, width: 2048, height: 2048, x0: 0 };
@@ -218,14 +310,79 @@ describe("shared spatial raster planning", () => {
       ch: 16,
       strideX: 1,
       strideY: 1,
+      // 16 pixels over 1000 × 800 CSS pixels → blocks of 62 × 50 pixels.
+      zoomX: 62,
+      zoomY: 50,
     });
     expect(raster?.placement).toEqual({
-      x0: 2058,
+      x: 2057.5,
       dx: 1,
-      y0: 0,
+      y: -0.5,
       dy: 1,
       cw: 16,
       ch: 16,
+    });
+  });
+});
+
+describe("zoomed-in magnification (crisp pixels)", () => {
+  it("magnifies a whole small image when it fits once magnified", () => {
+    const geometry = { width: 4, height: 4, x0: 0, y0: 0, dx: 1, dy: 1 };
+    const raster = planImageRaster(geometry, null, { w: 400, h: 400 }, 1);
+    expect(raster?.plan).toMatchObject({
+      i0: 0,
+      j0: 0,
+      cw: 4,
+      ch: 4,
+      strideX: 1,
+      strideY: 1,
+      zoomX: 100,
+      zoomY: 100,
+    });
+  });
+
+  it("magnifies the visible window of a small image zoomed in", () => {
+    // 512² image, pixels 100…115 shown over 800 px: the whole image would
+    // exceed the bitmap cap once magnified, so only the window is painted.
+    const geometry = { width: 512, height: 512, x0: 0, y0: 0, dx: 1, dy: 1 };
+    const view = {
+      x: [99.5, 115.5] as [number, number],
+      y: [115.5, 99.5] as [number, number],
+    };
+    const raster = planImageRaster(geometry, view, { w: 800, h: 800 }, 1);
+    expect(raster?.plan).toEqual({
+      i0: 100,
+      j0: 100,
+      cw: 16,
+      ch: 16,
+      strideX: 1,
+      strideY: 1,
+      zoomX: 50,
+      zoomY: 50,
+    });
+    // The magnified bitmap keeps the physical extent of its 16 pixels.
+    expect(raster?.placement).toEqual({
+      x: 99.5,
+      dx: 1,
+      y: 99.5,
+      dy: 1,
+      cw: 16,
+      ch: 16,
+    });
+  });
+
+  it("paints a small image whole and 1:1 when not zoomed in", () => {
+    const geometry = { width: 1000, height: 1000, x0: 0, y0: 0, dx: 1, dy: 1 };
+    const raster = planImageRaster(geometry, null, { w: 800, h: 800 }, 1);
+    expect(raster?.plan).toEqual({
+      i0: 0,
+      j0: 0,
+      cw: 1000,
+      ch: 1000,
+      strideX: 1,
+      strideY: 1,
+      zoomX: 1,
+      zoomY: 1,
     });
   });
 });

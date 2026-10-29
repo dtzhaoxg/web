@@ -3143,13 +3143,16 @@ def detach_object_array(oid: str) -> bytes:
     return payload
 
 
-def attach_object_array(oid: str, payload: bytes) -> bool:
+def attach_object_array(oid: str, payload: bytes, on_disk: bool = True) -> bool:
     """Restore *oid*'s heavy array from ``.npy`` *payload* (page-in).
 
     Args:
         oid: object identifier in :data:`_MODEL`.
         payload: the ``.npy`` bytes previously returned by
          :func:`detach_object_array` (read back from OPFS by JS).
+        on_disk: whether the on-disk copy of the object is *payload* (page-in).
+         False when *payload* could not be persisted: the object then has no
+         current on-disk copy, and is serialized again before being released.
 
     Returns:
         ``True`` when the array was restored, ``False`` when *oid* was not
@@ -3174,7 +3177,10 @@ def attach_object_array(oid: str, payload: bytes) -> bool:
     arr = np.load(io.BytesIO(data), allow_pickle=False)
     setattr(entry.obj, _SPILLED[oid]["attr"], arr)
     _SPILLED.pop(oid, None)
-    _PAGED_IN_REVISIONS[oid] = _DATA_REVISIONS.get(oid, 0)
+    if on_disk:
+        _PAGED_IN_REVISIONS[oid] = _DATA_REVISIONS.get(oid, 0)
+    else:
+        _PAGED_IN_REVISIONS.pop(oid, None)
     return True
 
 
@@ -3683,6 +3689,16 @@ def _image_data_payload(
     lut_min, lut_max = display["lut_default"]
     data = _maybe_downsample(raw, max_size)
     is_uniform = bool(getattr(obj, "is_uniform_coords", True))
+    # Decimated previews keep the physical extent of the image: each shipped
+    # pixel stands for a block of source pixels, so the spacing grows by the
+    # size ratio and the first center moves by half the spacing increase
+    # (``x0``/``y0`` are pixel centers).
+    dx = float(getattr(obj, "dx", 1.0) or 1.0)
+    dy = float(getattr(obj, "dy", 1.0) or 1.0)
+    preview_dx = dx * (raw.shape[1] / data.shape[1])
+    preview_dy = dy * (raw.shape[0] / data.shape[0])
+    x0 = float(getattr(obj, "x0", 0.0) or 0.0) + 0.5 * (preview_dx - dx)
+    y0 = float(getattr(obj, "y0", 0.0) or 0.0) + 0.5 * (preview_dy - dy)
     xcoords: list[float] = []
     ycoords: list[float] = []
     if not is_uniform:
@@ -3699,10 +3715,10 @@ def _image_data_payload(
         "width": int(data.shape[1]),
         "height": int(data.shape[0]),
         "dtype": str(data.dtype),
-        "x0": float(getattr(obj, "x0", 0.0) or 0.0),
-        "y0": float(getattr(obj, "y0", 0.0) or 0.0),
-        "dx": float(getattr(obj, "dx", 1.0) or 1.0) * (raw.shape[1] / data.shape[1]),
-        "dy": float(getattr(obj, "dy", 1.0) or 1.0) * (raw.shape[0] / data.shape[0]),
+        "x0": x0,
+        "y0": y0,
+        "dx": preview_dx,
+        "dy": preview_dy,
         "is_uniform_coords": is_uniform,
         "xcoords": xcoords,
         "ycoords": ycoords,
@@ -4846,7 +4862,7 @@ def get_feature_schema(
     When *source_oid* is given, the source object is bound to the parameter
     instance (via ``update_from_obj``) before serialisation so params that
     derive defaults from the source (e.g. ``RadialProfileParam`` pre-filling
-    ``x0``/``y0`` with the image centre) match DataLab desktop.
+    ``xc``/``yc`` with the image centre) match DataLab desktop.
     """
     source_obj = _MODEL.get(source_oid) if source_oid else None
     return _proc.get_schema(_full_catalog_with_plugins(), feature_id, source_obj)
@@ -4875,7 +4891,7 @@ def resolve_feature_callbacks(
 
     Returns the recomputed values for every parameter so the frontend can
     refresh read-only computed fields (e.g. ``ArithmeticParam.operation``,
-    or ``RadialProfileParam``'s ``x0``/``y0`` recomputed from the chosen
+    or ``RadialProfileParam``'s ``xc``/``yc`` recomputed from the chosen
     centre mode when *source_oid* is provided).
     """
     source_obj = _MODEL.get(source_oid) if source_oid else None
@@ -7474,13 +7490,14 @@ def h5_browser_import(
 ) -> dict[str, Any]:
     """Import every node in *node_ids* into the live model.
 
-    Returns ``{"oids": [...], "uint32_clipped": bool}``.
+    Returns ``{"oids": [...], "inexact_values": bool}``, *inexact_values*
+    being True when integer values could not all be represented exactly.
     """
     result = _h5br.import_nodes(file_id, node_ids, group_id=group_id)
     oids: list[str] = []
     for kind, obj in result["objects"]:
         oids.append(_MODEL.add_object(kind, obj, group_id=result["group_id"]))
-    return {"oids": oids, "uint32_clipped": bool(result["uint32_clipped"])}
+    return {"oids": oids, "inexact_values": bool(result["inexact_values"])}
 
 
 # ---------------------------------------------------------------------------
